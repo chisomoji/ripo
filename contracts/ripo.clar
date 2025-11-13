@@ -17,6 +17,9 @@
 (define-data-var max-participants uint u100)
 (define-data-var lottery-finalized bool false)
 (define-data-var participant-list (list 100 principal) (list))
+(define-data-var revealed-counter uint u0)
+(define-data-var reveal-randomness uint u0)
+(define-data-var revealed-participants (list 100 principal) (list))
 
 ;; Error codes
 (define-constant ERR-HASH-MISMATCH (err u1))
@@ -31,6 +34,9 @@
 (define-constant ERR-ALREADY-FINALIZED (err u10))
 (define-constant ERR-NO-REVEALS (err u11))
 (define-constant ERR-ALREADY-COMMITTED (err u12))
+(define-constant ERR-REFUND-UNAVAILABLE (err u13))
+(define-constant ERR-NO-REFUNDABLE-ENTRY (err u14))
+(define-constant MAX-RANDOM-NUM u4294967296)
 
 ;; Helper function to convert single byte to uint
 (define-private (byte-to-uint (b (buff 1)))
@@ -48,6 +54,17 @@
             (byte-to-uint fourth-byte))
          u1000000)))
 
+;; Helper to derive a broader randomness sample from commitment hashes
+(define-private (hash-to-uint32 (hash (buff 32)))
+  (let ((first-byte (unwrap-panic (element-at hash u0)))
+        (second-byte (unwrap-panic (element-at hash u1)))
+        (third-byte (unwrap-panic (element-at hash u2)))
+        (fourth-byte (unwrap-panic (element-at hash u3))))
+    (+ (* (byte-to-uint first-byte) u16777216)
+       (* (byte-to-uint second-byte) u65536)
+       (* (byte-to-uint third-byte) u256)
+       (byte-to-uint fourth-byte))))
+
 ;; Initialize lottery with phases and parameters
 (define-public (start-lottery (commit-duration uint) (reveal-duration uint) (fee uint) (max-entries uint))
   (begin
@@ -61,6 +78,9 @@
     (var-set total-prize-pool u0)
     (var-set lottery-finalized false)
     (var-set participant-list (list))
+    (var-set revealed-counter u0)
+    (var-set reveal-randomness u0)
+    (var-set revealed-participants (list))
     (ok true)))
 
 ;; Legacy function for backward compatibility
@@ -97,36 +117,37 @@
     (let ((c (map-get? commitments tx-sender)))
       (match c
         val
-          (begin
-            (asserts! (not (get revealed val)) ERR-ALREADY-REVEALED)
-            (asserts! (is-eq (get commit val) (sha256 nonce)) ERR-HASH-MISMATCH)
-            (map-set commitments tx-sender { 
-              commit: (get commit val), 
-              revealed: true, 
-              ticket-number: (get ticket-number val) 
-            })
-            (ok true))
+          (let ((nonce-hash (sha256 nonce)))
+            (begin
+              (asserts! (not (get revealed val)) ERR-ALREADY-REVEALED)
+              (asserts! (is-eq (get commit val) nonce-hash) ERR-HASH-MISMATCH)
+              (map-set commitments tx-sender { 
+                commit: (get commit val), 
+                revealed: true, 
+                ticket-number: (get ticket-number val) 
+              })
+              (var-set revealed-counter (+ (var-get revealed-counter) u1))
+              (var-set reveal-randomness (mod (+ (var-get reveal-randomness) (hash-to-uint32 nonce-hash)) MAX-RANDOM-NUM))
+              (var-set revealed-participants (unwrap! (as-max-len? (append (var-get revealed-participants) tx-sender) u100) ERR-MAX-PARTICIPANTS-REACHED))
+              (ok true)))
         ERR-NO-COMMITMENT))))
 
 ;; Finalize lottery and select winner
 (define-public (finalize-lottery)
   (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (asserts! (>= stacks-block-height (var-get reveal-phase-end)) ERR-NOT-REVEAL-PHASE)
     (asserts! (not (var-get lottery-finalized)) ERR-ALREADY-FINALIZED)
-    (asserts! (> (var-get entry-counter) u0) ERR-NO-REVEALS)
+    (asserts! (> (var-get revealed-counter) u0) ERR-NO-REVEALS)
     
-    ;; Simple winner selection based on block hash and entry count
-    (let ((winner-index (+ (mod stacks-block-height (var-get entry-counter)) u1)))
-      (match (map-get? entries winner-index)
-        entry
-          (let ((winner (get participant entry))
-                (prize (/ (* (var-get total-prize-pool) u90) u100))) ;; 90% of pool to winner
-            (map-set winners u1 { participant: winner, prize-amount: prize })
-            (try! (as-contract (stx-transfer? prize tx-sender winner)))
-            (var-set lottery-finalized true)
-            (ok winner))
-        ERR-NO-REVEALS))))
+    ;; Winner is selected from revealed participants using accumulated randomness plus block height
+    (let ((revealed-count (var-get revealed-counter))
+          (random-base (mod (+ (var-get reveal-randomness) stacks-block-height) revealed-count)))
+      (let ((winner (unwrap-panic (element-at (var-get revealed-participants) random-base)))
+            (prize (/ (* (var-get total-prize-pool) u90) u100))) ;; 90% of pool to winner
+        (map-set winners u1 { participant: winner, prize-amount: prize })
+        (try! (as-contract (stx-transfer? prize tx-sender winner)))
+        (var-set lottery-finalized true)
+        (ok winner)))))
 
 ;; Owner can withdraw remaining funds after finalization
 (define-public (withdraw-remaining)
@@ -137,6 +158,25 @@
       (and (> remaining u0)
            (try! (as-contract (stx-transfer? remaining tx-sender (var-get contract-owner)))))
       (ok remaining))))
+
+;; Participants can reclaim their entry fee if no reveals occurred and the lottery never finalized
+(define-public (claim-refund)
+  (let ((participant tx-sender))
+    (begin
+      (asserts! (>= stacks-block-height (var-get reveal-phase-end)) ERR-NOT-REVEAL-PHASE)
+      (asserts! (is-eq (var-get revealed-counter) u0) ERR-REFUND-UNAVAILABLE)
+      (asserts! (not (var-get lottery-finalized)) ERR-ALREADY-FINALIZED)
+      (let ((c (map-get? commitments participant)))
+        (match c
+          val
+            (begin
+              (asserts! (not (get revealed val)) ERR-ALREADY-REVEALED)
+              (asserts! (>= (var-get total-prize-pool) (var-get entry-fee)) ERR-INSUFFICIENT-PAYMENT)
+              (map-delete commitments participant)
+              (var-set total-prize-pool (to-uint (- (to-int (var-get total-prize-pool)) (to-int (var-get entry-fee)))))
+              (try! (as-contract (stx-transfer? (var-get entry-fee) tx-sender participant)))
+              (ok true))
+          ERR-NO-REFUNDABLE-ENTRY)))))
 
 ;; Helper function to clear participant commitment
 (define-private (clear-participant-commitment (participant principal))
@@ -180,6 +220,9 @@
     (var-set total-prize-pool u0)
     (var-set lottery-finalized false)
     (var-set participant-list (list))
+    (var-set revealed-counter u0)
+    (var-set reveal-randomness u0)
+    (var-set revealed-participants (list))
     
     (ok true)))
 
@@ -235,5 +278,7 @@
     phases-cleared: (and (is-eq (var-get commit-phase-end) u0) (is-eq (var-get reveal-phase-end) u0)),
     counters-reset: (and (is-eq (var-get entry-counter) u0) (is-eq (var-get total-prize-pool) u0)),
     lottery-reset: (not (var-get lottery-finalized)),
-    participant-list-empty: (is-eq (len (var-get participant-list)) u0)
+    participant-list-empty: (is-eq (len (var-get participant-list)) u0),
+    reveal-state-reset: (and (is-eq (var-get revealed-counter) u0) (is-eq (var-get reveal-randomness) u0)),
+    revealed-participants-empty: (is-eq (len (var-get revealed-participants)) u0)
   })
